@@ -24,7 +24,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.audit import AuditLogger
-from core.auth import GoogleAuthManager, get_configured_mailbox_owner_email, send_email_guarded
+from core.auth import (
+    GoogleAuthManager,
+    create_calendar_event_guarded,
+    create_calendar_reminder_guarded,
+    get_configured_mailbox_owner_email,
+    send_email_guarded,
+)
 from core.models import ApprovalStatus, DraftReply, TriagedInbox
 from lab07_node_graph.graph import AgenticNodeGraph, GraphRunResult
 
@@ -1074,6 +1080,8 @@ def ensure_state(result: GraphRunResult) -> None:
         st.session_state.draft_states = {}
     if "draft_bodies" not in st.session_state:
         st.session_state.draft_bodies = {}
+    if "confirmed_action_ids" not in st.session_state:
+        st.session_state.confirmed_action_ids = set()
 
     inbox = result.triaged_inbox
     if not inbox:
@@ -1222,6 +1230,49 @@ _MONTH_NAME_TO_INT = {
     "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
     "november": 11, "nov": 11, "december": 12, "dec": 12,
 }
+
+
+def parse_verified_meeting_slot(label: str) -> Optional[Dict[str, Any]]:
+    """Parse only labels produced by the verified calendar slot checker."""
+    match = re.match(
+        r"Calendar-checked \(([^)]+)\): [A-Za-z]+ (\d+) ([A-Za-z]+) · (\d{2}):(\d{2}) (AM|PM)",
+        label,
+    )
+    if not match:
+        return None
+
+    timezone_name, day_text, month_text, hour_text, minute_text, meridiem = match.groups()
+    month_number = _MONTH_NAME_TO_INT.get(month_text.lower())
+    if not month_number:
+        return None
+
+    hour = int(hour_text)
+    if meridiem == "PM" and hour != 12:
+        hour += 12
+    if meridiem == "AM" and hour == 12:
+        hour = 0
+
+    year = datetime.datetime.now().year
+    try:
+        import zoneinfo
+
+        local_timezone = zoneinfo.ZoneInfo(timezone_name)
+        candidate = datetime.datetime(
+            year,
+            month_number,
+            int(day_text),
+            hour,
+            int(minute_text),
+            tzinfo=local_timezone,
+        )
+    except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+        return None
+
+    return {
+        "timezone_name": timezone_name,
+        "start": candidate,
+        "end": candidate + datetime.timedelta(hours=1),
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1509,11 +1560,7 @@ def render_gmail_row(sender: str, subject: str, preview: str, chips: List[str], 
     if details_html:
         details_block = f'<div class="gmail-details">{details_html}'
         if show_checkbox:
-            details_block += (
-                '<div class="gmail-confirm-row">'
-                '<label class="gmail-action-check"><input type="checkbox" /> Mark Confirmed</label>'
-                '</div>'
-            )
+            details_block += '<div class="gmail-confirm-row"><span class="gmail-confirm-status">Faculty confirmation required</span></div>'
         details_block += '</div>'
     st.markdown(
         f'<details class="gmail-item"><summary class="gmail-summary">{row_html}</summary>{details_block}</details>',
@@ -1985,8 +2032,12 @@ def main() -> None:
     with tabs[2]:
         st.markdown("### Action Items & Commitments")
         st.caption("Concrete tasks, deadlines, and ownership extracted from the mailbox threads.")
-        if actions:
-            for row in actions:
+        visible_actions = [
+            row for row in actions
+            if row["Thread ID"] not in st.session_state.confirmed_action_ids
+        ]
+        if visible_actions:
+            for row in visible_actions:
                 chips = [gmail_chip("Action", tone="pending")]
                 deadline = row["Deadline"] if row["Deadline"] and row["Deadline"] != "None specified" else None
                 if deadline:
@@ -2007,8 +2058,25 @@ def main() -> None:
                     "",
                     unread=False,
                     details_html=details,
-                    show_checkbox=True,
+                    show_checkbox=False,
                 )
+                if st.checkbox(
+                    "Mark Confirmed",
+                    key=f"confirm_action_{row['Thread ID']}",
+                    help="Remove this action from the visible pending list.",
+                ):
+                    st.session_state.confirmed_action_ids.add(row["Thread ID"])
+                    audit.log(
+                        agent="Dashboard",
+                        intent="confirm_action_item",
+                        action="mark_confirmed",
+                        input_data={
+                            "thread_id": row["Thread ID"],
+                            "task": row["Task Description"],
+                        },
+                        result={"status": "confirmed", "visible": False},
+                    )
+                    st.rerun()
         else:
             render_empty_state("-", "No Action Items", "No pending tasks or deadlines detected in current inbox threads.")
 
@@ -2031,6 +2099,150 @@ def main() -> None:
                     f"<strong>Triage Status:</strong> {html.escape(row['Triage Status'])}"
                 )
                 render_gmail_row("Follow-up Review", row["Subject"], row["Resurface Timing"], chips, "Scheduled", unread=True, details_html=details)
+
+                reminder_cols = st.columns([2, 1, 1])
+                with reminder_cols[0]:
+                    reminder_due = st.datetime_input(
+                        "Reminder due time",
+                        value=datetime.datetime.now().replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1),
+                        key=f"reminder_due_{row['Thread ID']}_{row['Follow-up Type']}",
+                        label_visibility="collapsed",
+                    )
+                with reminder_cols[1]:
+                    reminder_minutes = st.selectbox(
+                        "Notify before",
+                        [15, 30, 60],
+                        index=0,
+                        format_func=lambda minutes: f"{minutes} min",
+                        key=f"reminder_offset_{row['Thread ID']}_{row['Follow-up Type']}",
+                        label_visibility="collapsed",
+                    )
+                with reminder_cols[2]:
+                    if st.button(
+                        "Set Reminder",
+                        key=f"reminder_add_{row['Thread ID']}_{row['Follow-up Type']}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            import zoneinfo
+
+                            auth = GoogleAuthManager(
+                                credentials_path=str(ROOT / "credentials.json"),
+                                token_path=str(ROOT / "token.json"),
+                            )
+                            calendar_service = auth.get_calendar_service(interactive=False)
+                            calendar_info = calendar_service.calendars().get(calendarId="primary").execute()
+                            timezone_name = calendar_info.get("timeZone")
+                            if not timezone_name:
+                                raise RuntimeError("Primary Calendar timezone could not be determined.")
+
+                            due_datetime = reminder_due
+                            if due_datetime.tzinfo is None:
+                                due_datetime = due_datetime.replace(tzinfo=zoneinfo.ZoneInfo(timezone_name))
+
+                            gmail = auth.get_gmail_service(interactive=False)
+                            created = create_calendar_reminder_guarded(
+                                calendar_service=calendar_service,
+                                gmail_service=gmail,
+                                summary=row["Subject"],
+                                due_datetime=due_datetime,
+                                timezone_name=timezone_name,
+                                reminder_minutes=int(reminder_minutes),
+                                description=f"Follow-up reminder for thread {row['Thread ID']}.",
+                            )
+                            audit.log(
+                                agent="Dashboard",
+                                intent="create_followup_reminder",
+                                action="create_calendar_reminder_guarded",
+                                input_data={
+                                    "thread_id": row["Thread ID"],
+                                    "due_datetime": due_datetime.isoformat(),
+                                    "reminder_minutes": reminder_minutes,
+                                },
+                                result={
+                                    "status": "created",
+                                    "event_id": created.get("id"),
+                                },
+                            )
+                            st.success(f"Reminder added to Google Calendar: {created.get('htmlLink') or created.get('id')}")
+                            fetch_calendar_events_for_month.clear()
+                            st.rerun()
+                        except Exception as exc:
+                            audit.log(
+                                agent="Dashboard",
+                                intent="create_followup_reminder",
+                                action="create_calendar_reminder_guarded_failed",
+                                input_data={"thread_id": row["Thread ID"]},
+                                result={"error": str(exc)},
+                                guardrail_passed=False,
+                            )
+                            st.error(f"Reminder not created: {exc}")
+
+                if row["Follow-up Type"] == "Meeting Request":
+                    verified_slots = [
+                        slot.strip()
+                        for slot in row["Resurface Timing"].split("; ")
+                        if parse_verified_meeting_slot(slot.strip()) is not None
+                    ]
+                    if verified_slots:
+                        control_cols = st.columns([3, 1])
+                        with control_cols[0]:
+                            selected_slot = st.selectbox(
+                                "Verified meeting slot",
+                                verified_slots,
+                                key=f"meeting_slot_{row['Thread ID']}",
+                                label_visibility="collapsed",
+                            )
+                        with control_cols[1]:
+                            if st.button(
+                                "Add to Calendar",
+                                key=f"calendar_add_{row['Thread ID']}",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                parsed_slot = parse_verified_meeting_slot(selected_slot)
+                                try:
+                                    auth = GoogleAuthManager(
+                                        credentials_path=str(ROOT / "credentials.json"),
+                                        token_path=str(ROOT / "token.json"),
+                                    )
+                                    gmail = auth.get_gmail_service(interactive=False)
+                                    calendar_service = auth.get_calendar_service(interactive=False)
+                                    created = create_calendar_event_guarded(
+                                        calendar_service=calendar_service,
+                                        gmail_service=gmail,
+                                        summary=f"Meeting: {row['Subject']}",
+                                        start_datetime=parsed_slot["start"],
+                                        end_datetime=parsed_slot["end"],
+                                        timezone_name=parsed_slot["timezone_name"],
+                                        description=f"Meeting request from follow-up thread {row['Thread ID']}.",
+                                    )
+                                    audit.log(
+                                        agent="Dashboard",
+                                        intent="approve_calendar_event",
+                                        action="create_calendar_event_guarded",
+                                        input_data={
+                                            "thread_id": row["Thread ID"],
+                                            "selected_slot": selected_slot,
+                                        },
+                                        result={
+                                            "status": "created",
+                                            "event_id": created.get("id"),
+                                        },
+                                    )
+                                    st.success(f"Added to Google Calendar: {created.get('htmlLink') or created.get('id')}")
+                                    fetch_calendar_events_for_month.clear()
+                                    st.rerun()
+                                except Exception as exc:
+                                    audit.log(
+                                        agent="Dashboard",
+                                        intent="approve_calendar_event",
+                                        action="create_calendar_event_guarded_failed",
+                                        input_data={"thread_id": row["Thread ID"]},
+                                        result={"error": str(exc)},
+                                        guardrail_passed=False,
+                                    )
+                                    st.error(f"Calendar event not created: {exc}")
             st.markdown('</div>', unsafe_allow_html=True)
         else:
             render_empty_state("-", "No Follow-up Items", "No reply-later flags or proposed meeting requests present.")

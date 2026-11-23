@@ -10,6 +10,7 @@ Enforces:
 from __future__ import annotations
 import os
 import json
+import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -102,6 +103,115 @@ class GoogleAuthManager:
     def get_calendar_service(self, interactive: bool = True):
         creds = self.get_credentials(interactive=interactive)
         return build("calendar", "v3", credentials=creds)
+
+
+def create_calendar_event_guarded(
+    calendar_service,
+    gmail_service,
+    summary: str,
+    start_datetime: datetime.datetime,
+    end_datetime: datetime.datetime,
+    timezone_name: str,
+    description: str = "",
+) -> Dict[str, Any]:
+    """Create a primary-calendar event only for the authenticated mailbox owner."""
+    if not summary or not start_datetime or not end_datetime:
+        raise ValueError("Calendar event summary and start/end times are required.")
+    if end_datetime <= start_datetime:
+        raise ValueError("Calendar event end time must be after its start time.")
+
+    expected_owner = get_configured_mailbox_owner_email()
+    if not expected_owner:
+        raise PermissionError("GUARDRAIL VIOLATION: The configured mailbox owner is missing.")
+
+    actual_account = (
+        gmail_service.users()
+        .getProfile(userId="me")
+        .execute()
+        .get("emailAddress", "")
+        .strip()
+        .lower()
+    )
+    if not actual_account or actual_account != expected_owner:
+        raise PermissionError(
+            "GUARDRAIL VIOLATION: The authenticated account does not match the configured mailbox owner."
+        )
+
+    event = {
+        "summary": summary,
+        "description": description,
+        "start": {
+            "dateTime": start_datetime.isoformat(),
+            "timeZone": timezone_name,
+        },
+        "end": {
+            "dateTime": end_datetime.isoformat(),
+            "timeZone": timezone_name,
+        },
+    }
+    return (
+        calendar_service.events()
+        .insert(calendarId="primary", body=event)
+        .execute()
+    )
+
+
+def create_calendar_reminder_guarded(
+    calendar_service,
+    gmail_service,
+    summary: str,
+    due_datetime: datetime.datetime,
+    timezone_name: str,
+    reminder_minutes: int = 15,
+    description: str = "",
+) -> Dict[str, Any]:
+    """Create a short primary-calendar reminder for the authenticated mailbox owner."""
+    if not summary or not due_datetime:
+        raise ValueError("Reminder summary and due time are required.")
+    if reminder_minutes not in {15, 30, 60}:
+        raise ValueError("Reminder must be 15, 30, or 60 minutes before due time.")
+
+    expected_owner = get_configured_mailbox_owner_email()
+    if not expected_owner:
+        raise PermissionError("GUARDRAIL VIOLATION: The configured mailbox owner is missing.")
+
+    actual_account = (
+        gmail_service.users()
+        .getProfile(userId="me")
+        .execute()
+        .get("emailAddress", "")
+        .strip()
+        .lower()
+    )
+    if not actual_account or actual_account != expected_owner:
+        raise PermissionError(
+            "GUARDRAIL VIOLATION: The authenticated account does not match the configured mailbox owner."
+        )
+
+    event = {
+        "summary": f"Reminder: {summary}",
+        "description": description,
+        "start": {
+            "dateTime": due_datetime.isoformat(),
+            "timeZone": timezone_name,
+        },
+        "end": {
+            "dateTime": (due_datetime + datetime.timedelta(minutes=15)).isoformat(),
+            "timeZone": timezone_name,
+        },
+        "reminders": {
+            "useDefault": False,
+            "overrides": [
+                {"method": "popup", "minutes": reminder_minutes},
+                {"method": "email", "minutes": reminder_minutes},
+            ],
+        },
+    }
+    return (
+        calendar_service.events()
+        .insert(calendarId="primary", body=event)
+        .execute()
+    )
 
 
 def send_email_guarded(
